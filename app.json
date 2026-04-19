@@ -1,0 +1,55 @@
+{
+  "expo": {
+    "name": "CarTalk",
+    "slug": "cartalk",
+    "scheme": "cartalk",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.cartalk.app",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "CarTalk gebruikt je lokale netwerk om tijdens ontwikkeling met de CarTalk server op je Mac te praten.",
+        "NSMicrophoneUsageDescription": "CarTalk gebruikt de microfoon om spraakmeldingen op te nemen terwijl je rijdt.",
+        "NSSpeechRecognitionUsageDescription": "CarTalk gebruikt spraakherkenning om handsfree te activeren met Hey CarTalk.",
+        "NSLocationWhenInUseUsageDescription": "CarTalk gebruikt je locatie om bestuurders in de buurt te vinden terwijl je rijdt.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "CarTalk gebruikt je locatie om bestuurders in de buurt te vinden terwijl je rijdt."
+      }
+    },
+    "android": {
+      "package": "com.cartalk.app"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-asset",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "CarTalk gebruikt de microfoon om spraakmeldingen op te nemen terwijl je rijdt.",
+          "enableBackgroundPlayback": true,
+          "enableBackgroundRecording": false
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "CarTalk gebruikt de microfoon om handsfree te kunnen luisteren.",
+          "speechRecognitionPermission": "CarTalk gebruikt spraakherkenning om handsfree te activeren met Hey CarTalk."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "CarTalk gebruikt je locatie om bestuurders in de buurt te vinden."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

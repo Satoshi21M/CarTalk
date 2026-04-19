@@ -1,0 +1,25 @@
+{
+  "rules": {
+    "geofire": {
+      "$userId": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid === $userId"
+      }
+    },
+    "presence": {
+      "$userId": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid === $userId"
+      }
+    },
+    "deliveries": {
+      "$userId": {
+        ".read": "auth != null && auth.uid === $userId",
+        "$messageId": {
+          ".write": "auth != null && newData.child('recipientUserId').val() === $userId",
+          ".validate": "newData.hasChildren(['id','senderUserId','recipientUserId','receiverOutput','senderVehicleLabel','createdAt'])"
+        }
+      }
+    }
+  }
+}

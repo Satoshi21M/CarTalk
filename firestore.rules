@@ -1,0 +1,45 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId)
+        && request.resource.data.id == userId
+        && request.resource.data.country == resource.data.country
+        && request.resource.data.language == resource.data.language;
+      allow delete: if false;
+    }
+
+    match /vehicles/{vehicleId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.country == 'NL'
+        && request.resource.data.isPrimary is bool
+        && request.resource.data.plateDisplay is string
+        && request.resource.data.plateNormalized is string
+        && request.resource.data.brand is string
+        && request.resource.data.vehicleType is string
+        && request.resource.data.color is string
+        && request.resource.data.verificationStatus is string;
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.plateNormalized == resource.data.plateNormalized
+        && request.resource.data.brand is string
+        && request.resource.data.vehicleType is string
+        && request.resource.data.color is string;
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+  }
+}
