@@ -70,7 +70,7 @@ app.get("/health", (_req, res) => {
     port: config.port,
     model: config.geminiLiveModel,
     analysisModel: config.geminiAnalysisModel,
-    analysisMode: "low-latency",
+    analysisMode: config.geminiAnalysisMode,
     liveInputRelayEnabled,
     activeDemoDevices: demoNetwork.getPresenceCount()
   });

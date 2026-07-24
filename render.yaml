@@ -13,6 +13,10 @@ services:
         value: gemini-3.1-flash-live-preview
       - key: GEMINI_ANALYZE_MODEL
         value: gemini-2.5-flash
+      - key: GEMINI_ANALYSIS_MODE
+        value: low-latency
+      - key: GEMINI_ANALYSIS_LOW_LATENCY_MODEL
+        value: gemini-2.5-flash-lite
       - key: GEMINI_ANALYSIS_FALLBACK_MODEL
         value: gemini-2.5-flash-lite
       - key: LIVE_RELAY_PORT
