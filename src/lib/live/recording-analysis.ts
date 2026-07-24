@@ -2,7 +2,7 @@ import { getRelayDebugSummary, getRelayHttpBaseUrl, getRelayHttpBaseUrls } from 
 import { VoiceOutputStyle } from "@/types/app-state";
 
 const RELAY_TIMEOUTS = {
-  health: 45_000,
+  health: 65_000,
   analysis: 22_000,
   speech: 32_000
 };

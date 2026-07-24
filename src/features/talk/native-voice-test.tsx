@@ -113,12 +113,20 @@ function delay(ms: number) {
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string) {
-  return Promise.race<T>([
-    promise,
-    new Promise<T>((_, reject) => {
-      setTimeout(() => reject(new Error(message)), ms);
-    })
-  ]);
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(message)), ms);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    );
+  });
 }
 
 function normalizeSpeech(text: string) {
@@ -1208,12 +1216,11 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         setAnalysisStatus("CarTalk laadt Gemini-audio...");
         responsePlaybackStartedRef.current = false;
         responsePlayerRef.current.volume = 1;
-        const spoken = await Promise.race([
+        const spoken = await withTimeout(
           requestLiveSpokenAlert(spokenPrompt, state.voiceOutputStyle),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("Gemini-audio duurde te lang om te laden.")), 30_000)
-          )
-        ]);
+          35_000,
+          "Gemini-audio duurde te lang om te laden."
+        );
         if (!isCurrentTurn(turnId)) {
           return;
         }

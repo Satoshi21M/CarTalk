@@ -3,7 +3,7 @@ import { getRelayHttpBaseUrl } from "@/lib/live/relay-host";
 import { InboundDelivery, VehicleProfile } from "@/types/app-state";
 
 const DEFAULT_NETWORK_TIMEOUT_MS = 8_000;
-const COLD_START_TIMEOUT_MS = 35_000;
+const COLD_START_TIMEOUT_MS = 60_000;
 const DELIVERY_TIMEOUT_MS = 12_000;
 
 async function requestHosted<T>(
