@@ -1,6 +1,6 @@
 import { NativeModules, Platform } from "react-native";
 
-export const DEFAULT_HOSTED_RELAY_BASE_URL = "https://cartalk-pb74.onrender.com";
+export const DEFAULT_HOSTED_RELAY_BASE_URL = "https://cartalk-relay-us.onrender.com";
 
 function normalizeBaseUrl(value: string) {
   const trimmed = value.trim();
