@@ -5,7 +5,6 @@ import * as FileSystem from "expo-file-system";
 import {
   AudioModule,
   RecordingPresets,
-  createAudioPlayer,
   setAudioModeAsync,
   setIsAudioActiveAsync,
   useAudioPlayerStatus,
@@ -25,17 +24,12 @@ import {
   requestRelayHealth,
   requestLiveSpokenAlert
 } from "@/lib/live/recording-analysis";
-import {
-  extractGeminiInputTranscription,
-  extractGeminiVoiceActivityType,
-  isGeminiTurnComplete
-} from "@/lib/live/gemini-message";
-import { LiveSession } from "@/lib/live/live-session";
 import { DrivingLocationService } from "@/lib/location/location-service";
 import { useAppState } from "@/lib/state/app-state";
 import { palette } from "@/theme/palette";
 import { typography } from "@/theme/typography";
 import { sendLiveDelivery } from "@/lib/firebase/realtime-db";
+import { sendHostedDelivery } from "@/lib/live/hosted-network";
 import { describeVehicleProfile } from "@/lib/vehicles/describe-vehicle";
 
 import {
@@ -53,7 +47,7 @@ type NativeVoiceTestProps = {
 };
 
 type MainPhase = "wake" | "listening" | "finalizing" | "processing" | "replying" | "success" | "failed";
-type FinalizeReason = "submit" | "silence" | "speech_timeout" | "recognizer_end" | "relay_vad_end";
+type FinalizeReason = "submit" | "silence";
 type AudioModeState = "listening" | "playback" | null;
 
 const WAKE_PHRASES = ["hey cartalk", "he cartalk", "hey car talk", "hé cartalk", "hee cartalk"];
@@ -108,9 +102,11 @@ const SUBMIT_PHRASES = [
   "klaar",
   "dat is alles"
 ];
-const COMMAND_SILENCE_TIMEOUT_MS = 4200;
-const ANALYSIS_TIMEOUT_MS = 14000;
-const RECIPIENT_RESOLUTION_TIMEOUT_MS = 2200;
+const COMMAND_SILENCE_TIMEOUT_MS = 6500;
+const EMPTY_COMMAND_TIMEOUT_MS = 12_000;
+const MAX_COMMAND_DURATION_MS = 45_000;
+const ANALYSIS_TIMEOUT_MS = 20_000;
+const RECIPIENT_RESOLUTION_TIMEOUT_MS = 5_000;
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -185,8 +181,7 @@ function isStopCommand(text: string) {
         normalized === phrase ||
         normalized.endsWith(` ${phrase}`) ||
         tail === phrase ||
-        tail.endsWith(phrase) ||
-        tail.includes(phrase)
+        tail.endsWith(` ${phrase}`)
     )
   ) {
     return true;
@@ -208,8 +203,7 @@ function includesSubmitCommand(text: string) {
         normalized === phrase ||
         normalized.endsWith(` ${phrase}`) ||
         tail === phrase ||
-        tail.endsWith(phrase) ||
-        tail.includes(phrase)
+        tail.endsWith(` ${phrase}`)
     )
   ) {
     return true;
@@ -277,20 +271,16 @@ function mergeTranscriptSnapshot(current: string, incoming: string) {
   return `${currentTrimmed} ${incomingTrimmed}`.trim();
 }
 
-function extractBestTranscript(results: Array<{ transcript?: string }> | undefined) {
+function extractBestTranscript(results: { transcript?: string; confidence?: number }[] | undefined) {
   if (!Array.isArray(results) || results.length === 0) {
     return "";
   }
 
-  const merged = results
-    .map((result) => result?.transcript?.trim() || "")
-    .filter(Boolean)
-    .join(" ")
-    .trim();
+  const bestResult = [...results]
+    .filter((result) => result?.transcript?.trim())
+    .sort((left, right) => (right.confidence ?? 0) - (left.confidence ?? 0))[0];
 
-  const latest = results[results.length - 1]?.transcript?.trim() || "";
-
-  return latest.length >= merged.length * 0.6 ? latest : merged;
+  return bestResult?.transcript?.trim() || "";
 }
 
 export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }: NativeVoiceTestProps) {
@@ -300,14 +290,14 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const [analysisStatus, setAnalysisStatus] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isDeliveringResponse, setIsDeliveringResponse] = useState(false);
-  const [isLiveStreaming, setIsLiveStreaming] = useState(false);
   const [mainPhase, setMainPhase] = useState<MainPhase>("wake");
   const [speechLevel, setSpeechLevel] = useState(-60);
-  const [isRecognitionRunning, setIsRecognitionRunning] = useState(false);
   const [listeningDotCount, setListeningDotCount] = useState(1);
   const listeningStatusOpacity = useRef(new Animated.Value(0.75)).current;
   const listeningStatusTranslateY = useRef(new Animated.Value(2)).current;
   const commandTranscriptRef = useRef("");
+  const commandStartedAtRef = useRef(0);
+  const commandLastResultAtRef = useRef(0);
   const wakeTranscriptBufferRef = useRef<string[]>([]);
   const turnSequenceRef = useRef(0);
   const activeTurnIdRef = useRef(0);
@@ -316,20 +306,17 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const mainPhaseRef = useRef<MainPhase>("wake");
   const isAnalyzingRef = useRef(false);
   const isDeliveringResponseRef = useRef(false);
-  const isLiveStreamingRef = useRef(false);
   const wakeRestartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const commandStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const commandSilenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wakeStartPromiseRef = useRef<Promise<void> | null>(null);
   const pendingCommandStartRef = useRef(false);
-  const liveReconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ignoreRecognitionEndUntilRef = useRef(0);
   const livePlaybackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveProcessingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const outcomeResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const ignoreNextLiveTurnRef = useRef(false);
   const restartWakeAfterResponseRef = useRef(false);
   const showSuccessAfterResponseRef = useRef(false);
-  const heardLiveSpeechRef = useRef(false);
-  const lastLiveSpeechAtRef = useRef(0);
   const responsePlaybackStartedRef = useRef(false);
   const responsePlaybackCompletedRef = useRef(false);
   const followUpResponseTextRef = useRef<string | null>(null);
@@ -339,12 +326,9 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const responsePlayAttemptCountRef = useRef(0);
   const responseStartRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveFallbackTextRef = useRef("");
-  const micStreamerRef = useRef<{ stop: () => Promise<void> } | null>(null);
-  const liveSessionRef = useRef<LiveSession | null>(null);
-  const liveReadyRef = useRef(false);
   const currentLocationRef = useRef<{ lat: number; lng: number } | null>(null);
-  const liveReconnectAttemptsRef = useRef(0);
   const handlingInboundDeliveryIdRef = useRef<string | null>(null);
+  const inboundDeliveryToAcknowledgeRef = useRef<string | null>(null);
   const relayHealthCheckedAtRef = useRef(0);
   const relayHealthPromiseRef = useRef<Promise<void> | null>(null);
   const relayHealthyRef = useRef(false);
@@ -352,7 +336,7 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const audioModeTransitionRef = useRef<Promise<void>>(Promise.resolve());
   const beepPlayer = useAudioPlayer(require("../../../assets/audio/listen-beep.wav"));
   const confirmPlayer = useAudioPlayer(require("../../../assets/audio/message-captured.wav"));
-  const [responsePlayer, setResponsePlayer] = useState(() => createAudioPlayer(null, 200));
+  const responsePlayer = useAudioPlayer(null, 100);
   const responsePlayerRef = useRef(responsePlayer);
   const responsePlayerStatus = useAudioPlayerStatus(responsePlayer);
 
@@ -366,9 +350,9 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const recorderState = useAudioRecorderState(recorder, 120);
 
   const isSetupListening = recorderState.isRecording;
-  const mainListening = mainPhase === "listening" && (isRecognitionRunning || isLiveStreaming);
+  const mainListening = mainPhase === "listening";
   const isListening = mode === "main" ? mainListening : isSetupListening;
-  const meterLevel = mode === "main" ? (isLiveStreaming ? recorderState.metering ?? speechLevel : speechLevel) : recorderState.metering ?? -60;
+  const meterLevel = mode === "main" ? speechLevel : recorderState.metering ?? -60;
   const isProcessing =
     mode === "main" &&
     (mainPhase === "finalizing" || mainPhase === "processing" || mainPhase === "replying" || isAnalyzing || isDeliveringResponse);
@@ -406,15 +390,6 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     setIsDeliveringResponse(nextValue);
   };
 
-  const updateLiveStreaming = (nextValue: boolean) => {
-    isLiveStreamingRef.current = nextValue;
-    setIsLiveStreaming(nextValue);
-  };
-
-  useEffect(() => {
-    responsePlayerRef.current = responsePlayer;
-  }, [responsePlayer]);
-
   const invalidateActiveTurn = () => {
     activeTurnIdRef.current = 0;
     finalizedTurnIdRef.current = null;
@@ -428,6 +403,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     finalizedTurnIdRef.current = null;
     finalizeReasonRef.current = null;
     commandTranscriptRef.current = initialTranscript.trim();
+    commandStartedAtRef.current = Date.now();
+    commandLastResultAtRef.current = initialTranscript.trim() ? Date.now() : 0;
     setAnalysis(null);
     setAnalysisStatus("");
     return activeTurnIdRef.current;
@@ -479,13 +456,6 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     }
   };
 
-  const clearLiveReconnect = () => {
-    if (liveReconnectTimeoutRef.current) {
-      clearTimeout(liveReconnectTimeoutRef.current);
-      liveReconnectTimeoutRef.current = null;
-    }
-  };
-
   const clearOutcomeReset = () => {
     if (outcomeResetTimeoutRef.current) {
       clearTimeout(outcomeResetTimeoutRef.current);
@@ -493,14 +463,33 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     }
   };
 
-  const stopRecognitionSession = async () => {
+  const waitForRecognitionToStop = async (timeoutMs = 1200) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      try {
+        if ((await ExpoSpeechRecognitionModule.getStateAsync()) === "inactive") {
+          return;
+        }
+      } catch {
+        return;
+      }
+      await delay(60);
+    }
+  };
+
+  const stopRecognitionSession = async ({ abort = true }: { abort?: boolean } = {}) => {
+    ignoreRecognitionEndUntilRef.current = Date.now() + 1500;
     try {
-      ExpoSpeechRecognitionModule.abort();
+      if (abort) {
+        ExpoSpeechRecognitionModule.abort();
+      } else {
+        ExpoSpeechRecognitionModule.stop();
+      }
     } catch {
       // Ignore recognition shutdown errors.
     }
 
-    setIsRecognitionRunning(false);
+    await waitForRecognitionToStop();
 
     try {
       await setIsAudioActiveAsync(false);
@@ -508,8 +497,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       // Ignore deactivate errors; the next audio mode transition will retry.
     }
 
-    // Give iOS a brief moment to release the speech/audio session before playback starts.
-    await delay(320);
+    // Let AVAudioEngine release its tap before another player changes the shared session.
+    await delay(120);
   };
 
   const teardownActiveVoiceIo = async () => {
@@ -518,16 +507,11 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     clearLivePlaybackTimeout();
     clearResponseStartRetry();
     clearLiveProcessingTimeout();
-    ignoreNextLiveTurnRef.current = true;
     restartWakeAfterResponseRef.current = false;
     showSuccessAfterResponseRef.current = false;
     followUpResponseTextRef.current = null;
     followUpShowSuccessRef.current = false;
     resetLivePlayback();
-    if (liveReadyRef.current) {
-      liveSessionRef.current?.sendRealtimeAudioEnd();
-    }
-    await stopLiveMicStreaming();
     await stopRecognitionSession();
     await clearResponseAudioFile();
   };
@@ -556,14 +540,13 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     clearResponseStartRetry();
     clearOutcomeReset();
     pendingCommandStartRef.current = false;
-    ignoreNextLiveTurnRef.current = false;
     restartWakeAfterResponseRef.current = false;
     showSuccessAfterResponseRef.current = false;
     followUpResponseTextRef.current = null;
     followUpShowSuccessRef.current = false;
-    heardLiveSpeechRef.current = false;
-    lastLiveSpeechAtRef.current = 0;
     commandTranscriptRef.current = "";
+    commandStartedAtRef.current = 0;
+    commandLastResultAtRef.current = 0;
     clearWakeTranscriptBuffer();
     liveFallbackTextRef.current = "";
     responsePlaybackStartedRef.current = false;
@@ -572,7 +555,6 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     responsePlayAttemptCountRef.current = 0;
     updateAnalyzing(false);
     updateDeliveringResponse(false);
-    updateLiveStreaming(false);
     setSpeechLevel(-60);
   };
 
@@ -599,7 +581,7 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     const normalized = message.toLowerCase();
 
     if (normalized.includes("/health") || normalized.includes("verbinding") || normalized.includes("network")) {
-      return "CarTalk kan Gemini nu niet bereiken. Controleer of de lokale relay-server draait.";
+      return "CarTalk kan de online service nu niet bereiken. Controleer je internetverbinding.";
     }
 
     return message || "CarTalk kan Gemini nu niet bereiken.";
@@ -608,7 +590,7 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const ensureRelayHealth = async ({ force = false, surfaceFailure = false } = {}) => {
     const now = Date.now();
 
-    if (!force && relayHealthyRef.current && now - relayHealthCheckedAtRef.current < 8_000) {
+    if (!force && relayHealthyRef.current && now - relayHealthCheckedAtRef.current < 5 * 60_000) {
       return;
     }
 
@@ -702,6 +684,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
 
   const markTurnFailed = (message: string) => {
     invalidateActiveTurn();
+    handlingInboundDeliveryIdRef.current = null;
+    inboundDeliveryToAcknowledgeRef.current = null;
     void (async () => {
       await teardownActiveVoiceIo();
       resetTurnState();
@@ -749,23 +733,14 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   };
 
   const replaceResponsePlayer = (source: { uri: string } | null) => {
-    const previousPlayer = responsePlayerRef.current;
-    const nextPlayer = createAudioPlayer(source, 200);
-    nextPlayer.volume = 1;
-    responsePlayerRef.current = nextPlayer;
-    setResponsePlayer(nextPlayer);
-
     try {
-      previousPlayer.pause();
+      responsePlayerRef.current.pause();
     } catch {
-      // Ignore cleanup failures while swapping players.
+      // The player may still be empty on the first turn.
     }
 
-    try {
-      previousPlayer.remove();
-    } catch {
-      // Ignore remove failures; next player is already active.
-    }
+    responsePlayerRef.current.replace(source);
+    responsePlayerRef.current.volume = 1;
   };
 
   const queueResponsePlayback = async (audioUri: string, turnId: number) => {
@@ -804,25 +779,25 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     if (!currentStatus.isLoaded) {
       setAnalysisStatus("CarTalk laadt Gemini-audio...");
       return;
+    }
+
+    responsePlayAttemptCountRef.current += 1;
+    clearResponseStartRetry();
+
+    try {
+      if (currentAudioModeRef.current !== "playback") {
+        await setPlaybackAudioMode();
+      } else {
+        await setIsAudioActiveAsync(true);
       }
 
-      responsePlayAttemptCountRef.current += 1;
-      clearResponseStartRetry();
-
-      try {
-        if (currentAudioModeRef.current !== "playback") {
-          await setPlaybackAudioMode();
-        } else {
-          await setIsAudioActiveAsync(true);
-        }
-
-        responsePlayerRef.current.volume = 1;
-        responsePlayerRef.current.play();
-        setAnalysisStatus("CarTalk start Gemini-reactie...");
-      } catch (error) {
-        console.warn(
-          "[CarTalk] Gemini playback attempt failed",
-          error instanceof Error ? error.message : error
+      responsePlayerRef.current.volume = 1;
+      responsePlayerRef.current.play();
+      setAnalysisStatus("CarTalk start Gemini-reactie...");
+    } catch (error) {
+      console.warn(
+        "[CarTalk] Gemini playback attempt failed",
+        error instanceof Error ? error.message : error
       );
     }
 
@@ -900,23 +875,6 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const setListeningAudioMode = async () => transitionAudioMode("listening");
 
   const setPlaybackAudioMode = async () => transitionAudioMode("playback");
-
-  const stopLiveMicStreaming = async () => {
-    const streamer = micStreamerRef.current;
-    micStreamerRef.current = null;
-
-    if (streamer) {
-      try {
-        await streamer.stop();
-      } catch {
-        // Ignore live mic shutdown errors; we'll still move to the next audio state.
-      }
-    }
-
-    updateLiveStreaming(false);
-    setSpeechLevel(-60);
-    await new Promise<void>((resolve) => setTimeout(resolve, 140));
-  };
 
   const stopAllVoiceActivity = (status: string = "CarTalk is gestopt.") => {
     clearWakeRestart();
@@ -1002,28 +960,17 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       return;
     }
 
-    // Capture transcript now — the ref may be overwritten by a stale recognizer
-    // result event that fires between stopLiveMicStreaming and stopRecognitionSession.
+    // Capture now because iOS may still emit a final result while recognition stops.
     const capturedTranscript = finalTranscript;
-    const shouldPlayBeep = reason !== "speech_timeout";
-
     commandTranscriptRef.current = capturedTranscript;
     updateMainPhase("finalizing");
     setAnalysisStatus("CarTalk verwerkt je melding...");
 
     void (async () => {
-      // Stop mic first while audio session is still in recording mode.
-      await stopLiveMicStreaming();
-      await stopRecognitionSession();
+      await stopRecognitionSession({ abort: false });
       await setPlaybackAudioMode();
-      if (shouldPlayBeep) {
-        playConfirmBeep();
-        await delay(120);
-      }
-      if (liveReadyRef.current) {
-        liveSessionRef.current?.sendRealtimeAudioEnd();
-      }
-
+      playConfirmBeep();
+      await delay(120);
       if (!isCurrentTurn(turnId) || finalizedTurnIdRef.current !== turnId) {
         return;
       }
@@ -1038,136 +985,130 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     requestFinalize(reason, commandTranscriptRef.current.trim());
   };
 
-  const finalizeLiveCommand = (transcriptOverride?: string, reason: FinalizeReason = "submit") => {
-    requestFinalize(reason, transcriptOverride ?? commandTranscriptRef.current.trim());
-  };
-
   const scheduleCommandSilenceTimeout = () => {
     clearCommandSilenceTimeout();
+    const now = Date.now();
+    const hasTranscript = Boolean(commandTranscriptRef.current.trim());
+    const commandStartedAt = commandStartedAtRef.current || now;
+    const lastSpeechAt = commandLastResultAtRef.current || commandStartedAt;
+    const deadline = Math.min(
+      commandStartedAt + MAX_COMMAND_DURATION_MS,
+      hasTranscript ? lastSpeechAt + COMMAND_SILENCE_TIMEOUT_MS : commandStartedAt + EMPTY_COMMAND_TIMEOUT_MS
+    );
+
     commandSilenceTimeoutRef.current = setTimeout(() => {
       if (commandTranscriptRef.current.trim()) {
         finalizeCurrentCommand("silence");
+      } else {
+        completeWithoutReply("Geen duidelijke melding gehoord. Probeer het nog eens.");
       }
-    }, COMMAND_SILENCE_TIMEOUT_MS);
-  };
-
-  const scheduleLiveFinalizeTimeout = (delay = 3000) => {
-    clearCommandSilenceTimeout();
-    commandSilenceTimeoutRef.current = setTimeout(() => {
-      if (
-        mainPhaseRef.current === "listening" &&
-        !isAnalyzingRef.current &&
-        !isDeliveringResponseRef.current &&
-        commandTranscriptRef.current.trim()
-      ) {
-        finalizeLiveCommand(commandTranscriptRef.current.trim(), "relay_vad_end");
-      }
-    }, delay);
+    }, Math.max(200, deadline - now));
   };
 
   const startWakeRecognition = async () => {
-    clearWakeRestart();
-    invalidateActiveTurn();
-    resetTurnState();
-    updateMainPhase("wake");
-    setAnalysis(null);
-    setAnalysisStatus("");
-
-    await setListeningAudioMode();
-    ExpoSpeechRecognitionModule.start({
-      lang: "nl-NL",
-      interimResults: true,
-      continuous: true,
-      addsPunctuation: false,
-      requiresOnDeviceRecognition: Platform.OS === "ios" && ExpoSpeechRecognitionModule.supportsOnDeviceRecognition(),
-      iosTaskHint: "confirmation",
-      contextualStrings: [
-        "Hey CarTalk",
-        "Hey Car Talk",
-        "CarTalk",
-        "car talk",
-        "cartalk",
-        "rode Mercedes",
-        "verlichting",
-        "achterlicht",
-        "band",
-        "deur",
-        "klep"
-      ],
-      volumeChangeEventOptions: {
-        enabled: true,
-        intervalMillis: 120
-      }
-    });
-  };
-
-  const startCommandRecognition = async () => {
-    clearWakeRestart();
-    clearCommandStart();
-    clearCommandSilenceTimeout();
-    if (!activeTurnIdRef.current) {
-      startNewTurn(commandTranscriptRef.current.trim());
-    }
-    updateLiveStreaming(false);
-    updateMainPhase("listening");
-    setAnalysisStatus("CarTalk luistert...");
-    setSpeechLevel(commandTranscriptRef.current.trim() ? -6 : -60);
-    resetLivePlayback();
-
-    try {
-      beepPlayer.volume = 1;
-      beepPlayer.pause();
-      await beepPlayer.seekTo(0);
-      beepPlayer.play();
-    } catch {
-      // Keep moving even if the activation sound itself fails.
+    if (wakeStartPromiseRef.current) {
+      return wakeStartPromiseRef.current;
     }
 
-    commandStartTimeoutRef.current = setTimeout(() => {
-      void (async () => {
+    wakeStartPromiseRef.current = (async () => {
+      clearWakeRestart();
+      invalidateActiveTurn();
+      resetTurnState();
+      updateMainPhase("wake");
+      setAnalysis(null);
+      setAnalysisStatus("");
+
+      try {
+        const recognitionState = await ExpoSpeechRecognitionModule.getStateAsync();
+        if (recognitionState !== "inactive") {
+          await stopRecognitionSession();
+        }
         await setListeningAudioMode();
         ExpoSpeechRecognitionModule.start({
           lang: "nl-NL",
           interimResults: true,
           continuous: true,
-          addsPunctuation: true,
-          iosTaskHint: "dictation",
+          addsPunctuation: false,
+          requiresOnDeviceRecognition:
+            Platform.OS === "ios" && ExpoSpeechRecognitionModule.supportsOnDeviceRecognition(),
+          iosTaskHint: "confirmation",
+          iosCategory: {
+            category: "playAndRecord",
+            categoryOptions: ["defaultToSpeaker", "allowBluetooth"],
+            mode: "measurement"
+          },
           contextualStrings: [
-            "kenteken",
-            "verlichting uit",
-            "achterlicht kapot",
-            "band zacht",
-            "deur open",
-            "klep open",
-            "zwarte Volvo",
-            "grijze Mercedes",
-            "verstuur",
-            "verzend",
-            "einde bericht",
-            "dat was het"
+            "Hey CarTalk",
+            "Hey Car Talk",
+            "CarTalk",
+            "car talk",
+            "cartalk",
+            "rode Mercedes",
+            "verlichting",
+            "achterlicht",
+            "band",
+            "deur",
+            "klep"
           ],
           volumeChangeEventOptions: {
             enabled: true,
             intervalMillis: 120
           }
         });
-        pendingCommandStartRef.current = false;
-        if (commandTranscriptRef.current.trim()) {
-          scheduleCommandSilenceTimeout();
-        }
-      })();
-    }, 280);
+      } catch (error) {
+        setAnalysisStatus(
+          error instanceof Error ? error.message : "CarTalk kon de spraakactivatie niet starten."
+        );
+      }
+    })().finally(() => {
+      wakeStartPromiseRef.current = null;
+    });
+
+    return wakeStartPromiseRef.current;
   };
 
-  const startOverlayCommandRecognition = async () => {
+  const startCommandRecognition = async ({ playActivationBeep = true } = {}) => {
+    clearWakeRestart();
+    clearCommandStart();
+    if (!activeTurnIdRef.current) {
+      startNewTurn(commandTranscriptRef.current.trim());
+    }
+    const turnId = activeTurnIdRef.current;
+    pendingCommandStartRef.current = true;
+    updateMainPhase("listening");
+    setAnalysisStatus("CarTalk luistert...");
+    setSpeechLevel(commandTranscriptRef.current.trim() ? -6 : -60);
+    resetLivePlayback();
+
+    await stopRecognitionSession();
+    if (!isCurrentTurn(turnId) || mainPhaseRef.current !== "listening") {
+      pendingCommandStartRef.current = false;
+      return;
+    }
+
     try {
       await setListeningAudioMode();
+      if (playActivationBeep) {
+        beepPlayer.volume = 1;
+        beepPlayer.pause();
+        await beepPlayer.seekTo(0);
+        beepPlayer.play();
+        await delay(260);
+      }
+      if (!isCurrentTurn(turnId) || mainPhaseRef.current !== "listening") {
+        return;
+      }
       ExpoSpeechRecognitionModule.start({
         lang: "nl-NL",
         interimResults: true,
         continuous: true,
         addsPunctuation: true,
         iosTaskHint: "dictation",
+        iosCategory: {
+          category: "playAndRecord",
+          categoryOptions: ["defaultToSpeaker", "allowBluetooth"],
+          mode: "measurement"
+        },
         contextualStrings: [
           "kenteken",
           "verlichting uit",
@@ -1175,33 +1116,58 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
           "band zacht",
           "deur open",
           "klep open",
+          "links blijven rijden",
+          "links plakken",
           "zwarte Volvo",
-          "rode Mercedes",
-          "ABC 123",
+          "grijze Mercedes",
+          "stop CarTalk",
           "verstuur",
           "verzend",
           "einde bericht",
-          "dat was het",
-          "stop cartalk"
+          "dat was het"
         ],
         volumeChangeEventOptions: {
           enabled: true,
           intervalMillis: 120
         }
       });
-    } catch (overlayErr) {
-      // Live audio continues, but stop/submit commands fall back to Gemini transcription only.
-      console.warn("[CarTalk] Overlay recognizer failed to start:", overlayErr);
+      scheduleCommandSilenceTimeout();
+    } catch (error) {
+      if (isCurrentTurn(turnId)) {
+        markTurnFailed(
+          error instanceof Error ? error.message : "CarTalk kon niet verder luisteren."
+        );
+      }
+    } finally {
+      pendingCommandStartRef.current = false;
     }
   };
 
-  const startLiveStreaming = async () => {
-    // The combined iOS path of local speech recognition + live mic streaming
-    // caused recurring AVAudioEngine format conflicts in production testing.
-    // Keep the command phase on the stable local recognizer path:
-    // wake word locally, capture command locally, analyze via Gemini server-side,
-    // and speak the result back via Gemini audio.
-    await startCommandRecognition();
+  const resumeCommandRecognition = () => {
+    if (
+      mainPhaseRef.current !== "listening" ||
+      pendingCommandStartRef.current ||
+      !activeTurnIdRef.current
+    ) {
+      return;
+    }
+
+    const elapsed = Date.now() - (commandStartedAtRef.current || Date.now());
+    if (elapsed >= MAX_COMMAND_DURATION_MS) {
+      if (commandTranscriptRef.current.trim()) {
+        finalizeCurrentCommand("silence");
+      } else {
+        completeWithoutReply("Geen duidelijke melding gehoord. Probeer het nog eens.");
+      }
+      return;
+    }
+
+    scheduleCommandSilenceTimeout();
+    pendingCommandStartRef.current = true;
+    clearCommandStart();
+    commandStartTimeoutRef.current = setTimeout(() => {
+      void startCommandRecognition({ playActivationBeep: false });
+    }, 220);
   };
 
   const speakLiveAlert = (text: string, showSuccessAfterPlayback: boolean, turnId: number) => {
@@ -1245,7 +1211,7 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         const spoken = await Promise.race([
           requestLiveSpokenAlert(spokenPrompt, state.voiceOutputStyle),
           new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("Gemini-audio duurde te lang om te laden.")), 15_000)
+            setTimeout(() => reject(new Error("Gemini-audio duurde te lang om te laden.")), 30_000)
           )
         ]);
         if (!isCurrentTurn(turnId)) {
@@ -1291,9 +1257,14 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         return;
       }
       setAnalysis(nextAnalysis);
-      const recipientResolution = state.voiceDeliveryConfirmationEnabled
+      const recipientResolution = nextAnalysis.applicable
         ? await withTimeout(
-            resolveRecipientForAnalysis(nextAnalysis, state.vehicleProfile, currentLocationRef.current),
+            resolveRecipientForAnalysis(
+              nextAnalysis,
+              state.vehicleProfile,
+              currentLocationRef.current,
+              state.userId
+            ),
             RECIPIENT_RESOLUTION_TIMEOUT_MS,
             "Recipient resolution timed out."
           ).catch(() => ({
@@ -1313,7 +1284,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       if (
         nextAnalysis.applicable &&
         finalRecipientResolution.status === "found" &&
-        finalRecipientResolution.lookupSource === "firebase"
+        (finalRecipientResolution.lookupSource === "firebase" ||
+          finalRecipientResolution.lookupSource === "hosted")
       ) {
         const recipientUserId = finalRecipientResolution.userId || "";
         const recipientIsReachable =
@@ -1323,14 +1295,19 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
 
         if (recipientIsReachable) {
           try {
-            await withTimeout(
-              sendLiveDelivery(recipientUserId, {
+            const deliveryPayload = {
                 senderUserId: state.userId,
                 receiverOutput: nextAnalysis.receiverOutput || spokenReply,
                 senderVehicleLabel: describeVehicleProfile(state.vehicleProfile),
                 createdAt: Date.now()
-              }),
-              2500,
+              };
+            const sendDelivery =
+              finalRecipientResolution.lookupSource === "firebase"
+                ? sendLiveDelivery(recipientUserId, deliveryPayload)
+                : sendHostedDelivery(recipientUserId, deliveryPayload);
+            await withTimeout(
+              sendDelivery,
+              5_000,
               "Live delivery timed out."
             );
           } catch {
@@ -1363,25 +1340,7 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         turnId
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Analyseren mislukt.";
-
-      if (message.includes("Missing GEMINI_API_KEY")) {
-        const demoAnalysis = {
-          rawText: "Demo mode",
-          transcript,
-          applicable: true,
-          reasonCategory: "vehicle_safety",
-          receiverOutput: "Een bestuurder heeft gemeld dat uw verlichting uit staat.",
-          targetDescription: "onbekend",
-          senderReply: "Een bestuurder heeft gemeld dat uw verlichting uit staat."
-        };
-        if (!isCurrentTurn(turnId) || finalizedTurnIdRef.current !== turnId) {
-          return;
-        }
-        setAnalysis(demoAnalysis);
-        setAnalysisStatus("Demo-uitvoer afgespeeld. Voeg GEMINI_API_KEY toe voor echte AI-verwerking.");
-        speakLiveAlert(demoAnalysis.senderReply, true, turnId);
-      } else if (isCurrentTurn(turnId)) {
+      if (isCurrentTurn(turnId)) {
         markTurnFailed(toAnalysisFailureMessage(error));
       }
     } finally {
@@ -1391,17 +1350,19 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   };
 
   useSpeechRecognitionEvent("start", () => {
-    setIsRecognitionRunning(true);
+    // The recognizer lifecycle is controlled by the explicit phase refs.
   });
 
   useSpeechRecognitionEvent("end", () => {
-    setIsRecognitionRunning(false);
-
     if (mode !== "main") {
       return;
     }
 
-    if (pendingCommandStartRef.current || isLiveStreamingRef.current) {
+    if (Date.now() < ignoreRecognitionEndUntilRef.current) {
+      return;
+    }
+
+    if (pendingCommandStartRef.current) {
       return;
     }
 
@@ -1413,17 +1374,9 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     if (
       mainPhaseRef.current === "listening" &&
       !isAnalyzingRef.current &&
-      !isDeliveringResponseRef.current &&
-      !isLiveStreamingRef.current
+      !isDeliveringResponseRef.current
     ) {
-      clearCommandSilenceTimeout();
-      const finalTranscript = commandTranscriptRef.current.trim();
-
-      if (finalTranscript) {
-        finalizeCurrentCommand("recognizer_end");
-      } else {
-        completeWithoutReply("Geen duidelijke melding gehoord. Probeer het nog eens.");
-      }
+      resumeCommandRecognition();
     }
   });
 
@@ -1449,10 +1402,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
 
       if (includesWakePhrase(combinedWakeTranscript || latestTranscript)) {
         onActivateDrivingMode();
-        startNewTurn(stripWakePhrase(combinedWakeTranscript || latestTranscript));
-        pendingCommandStartRef.current = true;
-        ExpoSpeechRecognitionModule.abort();
-        void startLiveStreaming();
+        startNewTurn(stripWakePhrase(latestTranscript));
+        void startCommandRecognition();
       }
 
       return;
@@ -1461,27 +1412,7 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     if (mainPhaseRef.current === "listening") {
       const nextTranscript = extractBestTranscript(event.results);
       setSpeechLevel(-6);
-
-      if (isLiveStreamingRef.current) {
-        const mergedTranscript = mergeTranscriptSnapshot(commandTranscriptRef.current, nextTranscript);
-
-        if (includesSubmitCommand(nextTranscript)) {
-          commandTranscriptRef.current = mergeTranscriptSnapshot(
-            commandTranscriptRef.current,
-            stripSubmitCommand(nextTranscript)
-          );
-          finalizeLiveCommand(commandTranscriptRef.current, "submit");
-          return;
-        }
-
-        commandTranscriptRef.current = mergedTranscript;
-        // Only schedule a fallback timer if no timer is already pending (Fix #3).
-        // Gemini VAD END sets a 450ms timer; we must not override it with 1200ms.
-        if (!commandSilenceTimeoutRef.current) {
-          scheduleLiveFinalizeTimeout();
-        }
-        return;
-      }
+      commandLastResultAtRef.current = Date.now();
 
       if (includesSubmitCommand(nextTranscript)) {
         commandTranscriptRef.current = mergeTranscriptSnapshot(
@@ -1492,12 +1423,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         return;
       }
 
-      commandTranscriptRef.current = nextTranscript;
+      commandTranscriptRef.current = mergeTranscriptSnapshot(commandTranscriptRef.current, nextTranscript);
       scheduleCommandSilenceTimeout();
-
-      if (event.isFinal) {
-        finalizeCurrentCommand("recognizer_end");
-      }
     }
   });
 
@@ -1506,45 +1433,15 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     setSpeechLevel(mapped);
   });
 
-  useEffect(() => {
-    if (mode !== "main" || mainPhase !== "listening" || !isLiveStreaming) {
-      return;
-    }
-
-    const meter = recorderState.metering ?? -60;
-    setSpeechLevel(meter);
-
-    const now = Date.now();
-    if (meter > -38) {
-      heardLiveSpeechRef.current = true;
-      lastLiveSpeechAtRef.current = now;
-      return;
-    }
-
-    if (
-      heardLiveSpeechRef.current &&
-      lastLiveSpeechAtRef.current > 0 &&
-      now - lastLiveSpeechAtRef.current > 2600 &&
-      !isAnalyzingRef.current &&
-      !isDeliveringResponseRef.current &&
-      mainPhaseRef.current === "listening"
-    ) {
-      heardLiveSpeechRef.current = false;
-      finalizeLiveCommand(commandTranscriptRef.current, "silence");
-    }
-  }, [isLiveStreaming, mainPhase, mode, recorderState.metering]);
-
   useSpeechRecognitionEvent("error", (event) => {
-    setIsRecognitionRunning(false);
+    if (event.error === "aborted") {
+      return;
+    }
 
     if (event.error === "no-speech" || event.error === "speech-timeout") {
       if (mode === "main") {
-        if (mainPhaseRef.current === "listening" && commandTranscriptRef.current.trim()) {
-          if (isLiveStreamingRef.current) {
-            finalizeLiveCommand(commandTranscriptRef.current.trim(), "speech_timeout");
-          } else {
-            finalizeCurrentCommand("speech_timeout");
-          }
+        if (mainPhaseRef.current === "listening") {
+          resumeCommandRecognition();
         } else {
           restartWakeAfterDelay(350);
         }
@@ -1570,7 +1467,6 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         if (mode === "main") {
           const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
           setMicPermission(permission.granted ? "granted" : "denied");
-          await setListeningAudioMode();
           await startWakeRecognition();
           void ensureRelayHealth({ surfaceFailure: true }).catch(() => {
             // The idle UI already gets a clearer status message via ensureRelayHealth.
@@ -1599,25 +1495,17 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       }
     })();
 
+    const responsePlayerForCleanup = responsePlayerRef.current;
     return () => {
       clearWakeRestart();
       clearCommandStart();
       clearCommandSilenceTimeout();
       clearLivePlaybackTimeout();
       clearLiveProcessingTimeout();
-      clearLiveReconnect();
       clearOutcomeReset();
       Speech.stop();
-      responsePlayerRef.current.pause();
-      try {
-        responsePlayerRef.current.remove();
-      } catch {
-        // Ignore player removal errors during teardown.
-      }
+      responsePlayerForCleanup.pause();
       void clearResponseAudioFile();
-      liveSessionRef.current?.disconnect();
-      liveSessionRef.current = null;
-
       if (mode === "main") {
         ExpoSpeechRecognitionModule.abort();
         if (locService && state.userId) {
@@ -1625,6 +1513,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         }
       }
     };
+    // This effect owns the native voice session and must not restart on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, state.userId]);
 
   useEffect(() => {
@@ -1686,6 +1576,14 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       setAnalysisStatus("");
       if (mainPhaseRef.current !== "replying") {
         updateMainPhase("replying");
+      }
+      const inboundDeliveryId = inboundDeliveryToAcknowledgeRef.current;
+      if (inboundDeliveryId) {
+        inboundDeliveryToAcknowledgeRef.current = null;
+        handlingInboundDeliveryIdRef.current = null;
+        void acknowledgeInboundDelivery(inboundDeliveryId).catch(() => {
+          // The hosted queue keeps the delivery until a later successful acknowledgement.
+        });
       }
       return;
     }
@@ -1751,6 +1649,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
         }
       }
     }
+    // Player status drives this state machine; unstable callback identities must not restart it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     clearOutcomeReset,
     isDeliveringResponse,
@@ -1782,123 +1682,18 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     }
 
     handlingInboundDeliveryIdRef.current = nextDelivery.id;
+    inboundDeliveryToAcknowledgeRef.current = nextDelivery.id;
     const turnId = startNewTurn("");
     queueFollowUpResponse(null, false);
     setAnalysisStatus("CarTalk ontvangt een veiligheidsmelding...");
 
-    void (async () => {
-      try {
-        await acknowledgeInboundDelivery(nextDelivery.id);
-        if (!isCurrentTurn(turnId)) {
-          return;
-        }
-        speakLiveAlert(nextDelivery.receiverOutput, false, turnId);
-      } finally {
-        handlingInboundDeliveryIdRef.current = null;
-      }
-    })();
-  }, [acknowledgeInboundDelivery, mode, pendingInboundDeliveries]);
-
-  useEffect(() => {
-    if (mode !== "main") {
+    if (!isCurrentTurn(turnId)) {
       return;
     }
-
-    const session = new LiveSession((event) => {
-      if (event.type === "ready") {
-        liveReadyRef.current = true;
-        liveReconnectAttemptsRef.current = 0; // reset backoff on successful connect (Fix #14)
-        return;
-      }
-
-      if (event.type === "status") {
-        if (event.message === "Relay connection closed.") {
-          liveReadyRef.current = false;
-          void stopLiveMicStreaming();
-          clearLiveReconnect();
-          liveReconnectAttemptsRef.current += 1;
-          const backoffMs = Math.min(1_500 * Math.pow(2, liveReconnectAttemptsRef.current - 1), 30_000);
-          liveReconnectTimeoutRef.current = setTimeout(() => {
-            session.connect();
-          }, backoffMs);
-        }
-        return;
-      }
-
-      if (event.type === "error") {
-        liveReadyRef.current = false;
-        void stopLiveMicStreaming();
-        clearLiveProcessingTimeout();
-        clearLiveReconnect();
-        // If an error occurs during active listening, try to finalise with what we have (Fix #15).
-        if (mainPhaseRef.current === "listening" && commandTranscriptRef.current.trim()) {
-          scheduleLiveFinalizeTimeout(1700);
-        }
-        liveReconnectAttemptsRef.current += 1;
-        const backoffMs = Math.min(1_500 * Math.pow(2, liveReconnectAttemptsRef.current - 1), 30_000);
-        liveReconnectTimeoutRef.current = setTimeout(() => {
-          session.connect();
-        }, backoffMs);
-        return;
-      }
-
-      const inputText = extractGeminiInputTranscription(event.payload);
-      if (inputText && mainPhaseRef.current === "listening") {
-        commandTranscriptRef.current = mergeTranscriptSnapshot(commandTranscriptRef.current, inputText);
-        setSpeechLevel(-6);
-
-        if (isStopCommand(inputText)) {
-          stopAllVoiceActivity();
-          return;
-        }
-
-        if (includesSubmitCommand(inputText)) {
-          finalizeLiveCommand(
-            mergeTranscriptSnapshot(commandTranscriptRef.current, stripSubmitCommand(inputText))
-          );
-          return;
-        }
-
-        scheduleLiveFinalizeTimeout();
-      }
-
-      const voiceActivityType = extractGeminiVoiceActivityType(event.payload);
-      if (voiceActivityType && mainPhaseRef.current === "listening") {
-        if (voiceActivityType.includes("START")) {
-          heardLiveSpeechRef.current = true;
-          lastLiveSpeechAtRef.current = Date.now();
-          setSpeechLevel(-6);
-        }
-
-        if (
-          voiceActivityType.includes("END") &&
-          isLiveStreamingRef.current &&
-          !isAnalyzingRef.current &&
-          !isDeliveringResponseRef.current
-        ) {
-          scheduleLiveFinalizeTimeout(1200);
-          return;
-        }
-      }
-
-      if (isGeminiTurnComplete(event.payload)) {
-        clearLiveProcessingTimeout();
-      }
-    });
-
-    liveSessionRef.current = session;
-    session.connect();
-
-    return () => {
-      liveReadyRef.current = false;
-      updateLiveStreaming(false);
-      clearLiveReconnect();
-      session.disconnect();
-      if (liveSessionRef.current === session) {
-        liveSessionRef.current = null;
-      }
-    };
-  }, [mode]);
+    speakLiveAlert(nextDelivery.receiverOutput, false, turnId);
+    // Delivery playback starts only when this queue or screen mode changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, pendingInboundDeliveries]);
 
   const runSetupAnalysis = async (uri: string) => {
     try {

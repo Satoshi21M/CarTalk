@@ -2,7 +2,7 @@ import { getUserPresence } from "@/lib/firebase/realtime-db";
 import { resolveRecipients } from "@/lib/location/proximity-query";
 import { matchRecipient } from "@/lib/matching/recipient-matcher";
 import { normalizeDutchPlate } from "@/features/vehicles/normalize-dutch-plate";
-import { buildPrototypeRecipients } from "@/features/talk/prototype-directory";
+import { resolveHostedRecipient } from "@/lib/live/hosted-network";
 import { RecordingAnalysis } from "@/lib/live/recording-analysis";
 import { getServiceMode } from "@/lib/services/service-mode";
 import { getVehicleService, RegisteredVehicle } from "@/lib/services/vehicle-service";
@@ -14,7 +14,7 @@ export type RecipientResolution =
       userId?: string;
       vehicleLabel: string;
       isOnline?: boolean;
-      lookupSource: "firebase" | "prototype";
+      lookupSource: "firebase" | "hosted";
     }
   | {
       status: "not_found";
@@ -39,7 +39,7 @@ function toTitleCase(value: string) {
     .join(" ");
 }
 
-function describeVehicleParts(parts: Array<string | null | undefined>) {
+function describeVehicleParts(parts: (string | null | undefined)[]) {
   const cleanParts = parts.map((part) => String(part || "").trim()).filter(Boolean);
   return cleanParts.length ? cleanParts.join(" ") : "";
 }
@@ -87,39 +87,6 @@ function buildVehicleHint(analysis: RecordingAnalysis) {
     .trim();
 
   return snippets || null;
-}
-
-function scorePrototypeRecipient(
-  normalizedSearchText: string,
-  candidatePlates: string[],
-  recipient: ReturnType<typeof buildPrototypeRecipients>[number]
-) {
-  let score = 0;
-  const recipientPlate = normalizeDutchPlate(recipient.plate);
-
-  if (candidatePlates.includes(recipientPlate)) {
-    score += 7;
-  }
-
-  const recipientLabel = normalizeText(recipient.label);
-  const recipientBrand = normalizeText(recipient.brand);
-  const recipientColor = normalizeText(recipient.color);
-  const recipientType = normalizeText(recipient.vehicleType);
-
-  if (recipientLabel && normalizedSearchText.includes(recipientLabel)) {
-    score += 4;
-  }
-  if (recipientBrand && normalizedSearchText.includes(recipientBrand)) {
-    score += 3;
-  }
-  if (recipientColor && normalizedSearchText.includes(recipientColor)) {
-    score += 2;
-  }
-  if (recipientType && normalizedSearchText.includes(recipientType)) {
-    score += 2;
-  }
-
-  return score;
 }
 
 async function resolveFirebaseRecipient(
@@ -172,43 +139,11 @@ async function resolveFirebaseRecipient(
   };
 }
 
-function resolvePrototypeRecipient(analysis: RecordingAnalysis, localVehicleProfile: VehicleProfile) {
-  const searchText = `${analysis.targetDescription || ""} ${analysis.transcript || ""}`;
-  const normalizedSearchText = normalizeText(searchText);
-  const candidatePlates = extractPlateCandidates(searchText);
-  const recipients = buildPrototypeRecipients(localVehicleProfile);
-
-  let bestMatch: { score: number; label: string } | null = null;
-
-  for (const recipient of recipients) {
-    const score = scorePrototypeRecipient(normalizedSearchText, candidatePlates, recipient);
-    if (score >= 4 && (!bestMatch || score > bestMatch.score)) {
-      bestMatch = {
-        score,
-        label: describeVehicleParts([
-          toTitleCase(recipient.color),
-          toTitleCase(recipient.brand),
-          toTitleCase(recipient.vehicleType)
-        ])
-      };
-    }
-  }
-
-  if (!bestMatch) {
-    return null;
-  }
-
-  return {
-    status: "found" as const,
-    vehicleLabel: bestMatch.label || "Andere bestuurder",
-    lookupSource: "prototype" as const
-  };
-}
-
 export async function resolveRecipientForAnalysis(
   analysis: RecordingAnalysis,
-  localVehicleProfile: VehicleProfile,
-  location: { lat: number; lng: number } | null = null
+  _localVehicleProfile: VehicleProfile,
+  location: { lat: number; lng: number } | null = null,
+  senderUserId: string = ""
 ): Promise<RecipientResolution> {
   if (!analysis.applicable) {
     return {
@@ -222,9 +157,17 @@ export async function resolveRecipientForAnalysis(
     return firebaseRecipient;
   }
 
-  const prototypeRecipient = resolvePrototypeRecipient(analysis, localVehicleProfile);
-  if (prototypeRecipient) {
-    return prototypeRecipient;
+  if (getServiceMode() !== "firebase" && senderUserId) {
+    const hostedRecipient = await resolveHostedRecipient(senderUserId, analysis);
+    if (hostedRecipient) {
+      return {
+        status: "found",
+        userId: hostedRecipient.userId,
+        vehicleLabel: hostedRecipient.vehicleLabel,
+        isOnline: hostedRecipient.isOnline,
+        lookupSource: "hosted"
+      };
+    }
   }
 
   return {

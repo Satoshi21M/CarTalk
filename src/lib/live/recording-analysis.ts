@@ -1,6 +1,21 @@
 import { getRelayDebugSummary, getRelayHttpBaseUrl, getRelayHttpBaseUrls } from "@/lib/live/relay-host";
 import { VoiceOutputStyle } from "@/types/app-state";
 
+const RELAY_TIMEOUTS = {
+  health: 45_000,
+  analysis: 22_000,
+  speech: 32_000
+};
+
+function readServerError(body: string, fallback: string) {
+  try {
+    const data = JSON.parse(body) as { error?: string };
+    return data.error || body || fallback;
+  } catch {
+    return body || fallback;
+  }
+}
+
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
 
@@ -17,20 +32,33 @@ async function fileUriToBase64(uri: string) {
   return bytesToBase64(new Uint8Array(buffer));
 }
 
-async function fetchRelay(path: string, init?: RequestInit) {
+async function fetchRelay(path: string, init?: RequestInit, timeoutMs: number = RELAY_TIMEOUTS.analysis) {
   const errors: string[] = [];
 
   for (const baseUrl of getRelayHttpBaseUrls()) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
       console.info("[CarTalk] Relay fetch", {
         path,
         url: `${baseUrl}${path}`,
         relay: getRelayDebugSummary()
       });
-      return await fetch(`${baseUrl}${path}`, init);
+      return await fetch(`${baseUrl}${path}`, {
+        ...init,
+        signal: controller.signal
+      });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Onbekende netwerkfout";
+      const message =
+        error instanceof Error && error.name === "AbortError"
+          ? `timeout na ${Math.round(timeoutMs / 1000)} seconden`
+          : error instanceof Error
+            ? error.message
+            : "Onbekende netwerkfout";
       errors.push(`${baseUrl}: ${message}`);
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -53,21 +81,20 @@ export type RecordingAnalysis = {
 export async function requestRelayHealth() {
   const response = await fetchRelay("/health", {
     method: "GET"
-  });
+  }, RELAY_TIMEOUTS.health);
 
   if (!response.ok) {
     const text = await response.text();
+    let serverError = "";
 
     try {
       const data = JSON.parse(text) as { error?: string };
-      throw new Error(
-        data.error ||
-          `CarTalk kon de lokale relay-server niet bereiken via ${getRelayHttpBaseUrl()}/health.`
-        
-      );
+      serverError = data.error || "";
     } catch {
-      throw new Error(text || `CarTalk kon de backend niet bereiken via ${getRelayHttpBaseUrl()}/health.`);
+      // Keep the plain response body below.
     }
+
+    throw new Error(serverError || text || `CarTalk kon de backend niet bereiken via ${getRelayHttpBaseUrl()}/health.`);
   }
 
   const data = (await response.json()) as {
@@ -90,20 +117,16 @@ export async function requestLiveSpokenAlert(text: string, voiceStyle: VoiceOutp
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ text, voiceStyle })
-  });
+  }, RELAY_TIMEOUTS.speech);
 
   if (!response.ok) {
     const body = await response.text();
-
-    try {
-      const data = JSON.parse(body) as { error?: string };
-      throw new Error(
-        data.error ||
-          `Gemini-audio ophalen mislukt via ${getRelayHttpBaseUrl()}/live-speak.`
-      );
-    } catch {
-      throw new Error(body || `Gemini-audio ophalen mislukt via ${getRelayHttpBaseUrl()}/live-speak.`);
-    }
+    throw new Error(
+      readServerError(
+        body,
+        `Gemini-audio ophalen mislukt via ${getRelayHttpBaseUrl()}/live-speak.`
+      )
+    );
   }
 
   const data = (await response.json()) as {
@@ -139,17 +162,11 @@ export async function analyzeDriverTranscript(transcript: string) {
     body: JSON.stringify({
       transcript
     })
-  });
+  }, RELAY_TIMEOUTS.analysis);
 
   if (!response.ok) {
     const text = await response.text();
-
-    try {
-      const data = JSON.parse(text) as { error?: string };
-      throw new Error(data.error || "Analyseren van transcript mislukt.");
-    } catch {
-      throw new Error(text || "Analyseren van transcript mislukt.");
-    }
+    throw new Error(readServerError(text, "Analyseren van transcript mislukt."));
   }
 
   const data = (await response.json()) as {
@@ -176,17 +193,11 @@ export async function analyzeRecordingFromUri(uri: string, mimeType: string = "a
       audioBase64,
       mimeType
     })
-  });
+  }, RELAY_TIMEOUTS.analysis);
 
   if (!response.ok) {
     const text = await response.text();
-
-    try {
-      const data = JSON.parse(text) as { error?: string };
-      throw new Error(data.error || "Analyseren van opname mislukt.");
-    } catch {
-      throw new Error(text || "Analyseren van opname mislukt.");
-    }
+    throw new Error(readServerError(text, "Analyseren van opname mislukt."));
   }
 
   const data = (await response.json()) as {

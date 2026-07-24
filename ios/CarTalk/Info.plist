@@ -42,8 +42,6 @@
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<false/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
 	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>CarTalk gebruikt de microfoon om spraakmeldingen op te nemen terwijl je rijdt.</string>
@@ -51,8 +49,6 @@
 	<string>CarTalk gebruikt je locatie om bestuurders in de buurt te vinden terwijl je rijdt.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>CarTalk gebruikt je locatie om bestuurders in de buurt te vinden terwijl je rijdt.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>CarTalk gebruikt je lokale netwerk om tijdens gebruik met de CarTalk server op je Mac te praten.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>CarTalk gebruikt spraakherkenning om handsfree te activeren met Hey CarTalk.</string>
 	<key>NSUserActivityTypes</key>

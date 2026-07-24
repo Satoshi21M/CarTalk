@@ -7,7 +7,14 @@ import {
   setUserPresence,
   subscribeToLiveDeliveries
 } from "@/lib/firebase/realtime-db";
+import {
+  acknowledgeHostedDelivery,
+  clearHostedPresence,
+  pollHostedDeliveries,
+  setHostedPresence
+} from "@/lib/live/hosted-network";
 import { getAuthService } from "@/lib/services/auth-service";
+import { getServiceMode } from "@/lib/services/service-mode";
 import { getVehicleService, VehicleRegistrationInput } from "@/lib/services/vehicle-service";
 import { loadPersistedState, savePersistedState } from "@/lib/storage/storage";
 import {
@@ -128,7 +135,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [isHydrated, state]);
 
   useEffect(() => {
-    if (!isHydrated || state.isSignedIn) {
+    const hasValidDeviceIdentity =
+      state.isSignedIn &&
+      Boolean(state.userId) &&
+      !state.userId.startsWith("mock-") &&
+      state.userId !== "local-user";
+
+    if (!isHydrated || hasValidDeviceIdentity) {
       return;
     }
 
@@ -155,7 +168,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [isHydrated, state.isSignedIn]);
+  }, [isHydrated, state.isSignedIn, state.userId]);
 
   useEffect(() => {
     if (!isHydrated || !state.isSignedIn || !state.userId || !state.setupComplete) {
@@ -163,29 +176,62 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     const vehicleLabel = describeVehicleProfile(state.vehicleProfile);
+    const serviceMode = getServiceMode();
     let active = true;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
 
     const syncPresence = async (nextStatus: string) => {
       if (!active) {
         return;
       }
 
-      if (nextStatus === "active") {
-        await setUserPresence(state.userId, vehicleLabel);
-      } else {
-        await clearUserPresence(state.userId);
+      try {
+        if (nextStatus === "active") {
+          if (serviceMode === "firebase") {
+            await setUserPresence(state.userId, vehicleLabel);
+          } else {
+            await setHostedPresence(state.userId, state.vehicleProfile, vehicleLabel);
+          }
+        } else if (serviceMode === "firebase") {
+          await clearUserPresence(state.userId);
+        } else {
+          await clearHostedPresence(state.userId);
+        }
+      } catch {
+        // Presence retries on the next heartbeat; voice use remains available.
       }
     };
 
     void syncPresence(NativeAppState.currentState);
+    if (NativeAppState.currentState === "active") {
+      heartbeat = setInterval(() => {
+        void syncPresence("active");
+      }, 20_000);
+    }
     const subscription = NativeAppState.addEventListener("change", (nextStatus) => {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+      if (nextStatus === "active") {
+        heartbeat = setInterval(() => {
+          void syncPresence("active");
+        }, 20_000);
+      }
       void syncPresence(nextStatus);
     });
 
     return () => {
       active = false;
       subscription.remove();
-      void clearUserPresence(state.userId);
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+      if (serviceMode === "firebase") {
+        void clearUserPresence(state.userId);
+      } else {
+        void clearHostedPresence(state.userId).catch(() => {});
+      }
     };
   }, [isHydrated, state.isSignedIn, state.setupComplete, state.userId, state.vehicleProfile]);
 
@@ -194,7 +240,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    return subscribeToLiveDeliveries(state.userId, (delivery) => {
+    const receiveDelivery = (delivery: InboundDelivery) => {
       setPendingInboundDeliveries((current) => {
         if (current.some((item) => item.id === delivery.id)) {
           return current;
@@ -214,7 +260,40 @@ export function AppProvider({ children }: { children: ReactNode }) {
           ...current.mockAlerts.filter((alert) => alert.id !== delivery.id)
         ].slice(0, 20)
       }));
-    });
+    };
+
+    if (getServiceMode() === "firebase") {
+      return subscribeToLiveDeliveries(state.userId, receiveDelivery);
+    }
+
+    let active = true;
+    let polling = false;
+    const poll = async () => {
+      if (!active || polling || NativeAppState.currentState !== "active") {
+        return;
+      }
+      polling = true;
+      try {
+        const deliveries = await pollHostedDeliveries(state.userId);
+        if (active) {
+          deliveries.forEach(receiveDelivery);
+        }
+      } catch {
+        // Polling automatically retries; a temporary network failure is not fatal.
+      } finally {
+        polling = false;
+      }
+    };
+
+    void poll();
+    const interval = setInterval(() => {
+      void poll();
+    }, 2_500);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   }, [isHydrated, state.isSignedIn, state.setupComplete, state.userId]);
 
   const value = useMemo<AppContextValue>(
@@ -301,7 +380,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
       async acknowledgeInboundDelivery(deliveryId) {
         setPendingInboundDeliveries((current) => current.filter((item) => item.id !== deliveryId));
         if (state.userId) {
-          await acknowledgeLiveDelivery(state.userId, deliveryId);
+          if (getServiceMode() === "firebase") {
+            await acknowledgeLiveDelivery(state.userId, deliveryId);
+          } else {
+            await acknowledgeHostedDelivery(state.userId, deliveryId);
+          }
         }
       },
       addInboxAlert(title, body, receivedAt = "Zojuist") {

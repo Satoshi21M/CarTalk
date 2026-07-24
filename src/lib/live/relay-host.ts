@@ -1,5 +1,7 @@
 import { NativeModules, Platform } from "react-native";
 
+export const DEFAULT_HOSTED_RELAY_BASE_URL = "https://cartalk-pb74.onrender.com";
+
 function normalizeBaseUrl(value: string) {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -58,9 +60,12 @@ function getExplicitHosts() {
 }
 
 function getExplicitBaseUrls() {
+  const configuredBaseUrls =
+    process.env.EXPO_PUBLIC_RELAY_BASE_URL?.trim() || DEFAULT_HOSTED_RELAY_BASE_URL;
+
   return Array.from(
     new Set(
-      (process.env.EXPO_PUBLIC_RELAY_BASE_URL || "")
+      configuredBaseUrls
         .split(",")
         .map((value) => normalizeBaseUrl(value))
         .filter((value): value is string => Boolean(value))

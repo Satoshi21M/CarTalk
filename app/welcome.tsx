@@ -4,12 +4,10 @@ import { View, Text } from "react-native";
 import { Button } from "@/components/button";
 import { Screen } from "@/components/screen";
 import { appCopy } from "@/content/copy";
-import { useAppState } from "@/lib/state/app-state";
 import { typography } from "@/theme/typography";
 
 export default function WelcomeScreen() {
   const router = useRouter();
-  const { state } = useAppState();
 
   return (
     <Screen

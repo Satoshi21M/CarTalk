@@ -13,7 +13,6 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.cartalk.app",
       "infoPlist": {
-        "NSLocalNetworkUsageDescription": "CarTalk gebruikt je lokale netwerk om tijdens ontwikkeling met de CarTalk server op je Mac te praten.",
         "NSMicrophoneUsageDescription": "CarTalk gebruikt de microfoon om spraakmeldingen op te nemen terwijl je rijdt.",
         "NSSpeechRecognitionUsageDescription": "CarTalk gebruikt spraakherkenning om handsfree te activeren met Hey CarTalk.",
         "NSLocationWhenInUseUsageDescription": "CarTalk gebruikt je locatie om bestuurders in de buurt te vinden terwijl je rijdt.",

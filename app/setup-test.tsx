@@ -30,7 +30,7 @@ export default function SetupTestScreen() {
     >
       <View style={{ gap: 18 }}>
         <Text style={typography.caption}>
-          Zeg bijvoorbeeld: "Yo man, je lichten zijn uit, zet ze even aan."
+          Zeg bijvoorbeeld: “Yo man, je lichten zijn uit, zet ze even aan.”
         </Text>
 
         <NativeVoiceTest

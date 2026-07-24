@@ -4,25 +4,124 @@ import express from "express";
 import { WebSocketServer } from "ws";
 
 import { getServerConfig } from "./config.mjs";
+import { createDemoNetworkStore } from "./demo-network.mjs";
 import { analyzeDriverTranscript, analyzeRecordedAudio } from "./gemini-audio-analyze.mjs";
 import { attachGeminiRelay } from "./gemini-live-relay.mjs";
 import { runGeminiLiveSpeak } from "./gemini-live-speak.mjs";
 
 const app = express();
 const server = http.createServer(app);
-const wsServer = new WebSocketServer({ server, path: "/live" });
 const config = getServerConfig();
 const listenHost = "0.0.0.0";
+const demoNetwork = createDemoNetworkStore();
+const liveInputRelayEnabled = process.env.ENABLE_LIVE_INPUT_RELAY === "true";
+const wsServer = liveInputRelayEnabled
+  ? new WebSocketServer({ server, path: "/live" })
+  : null;
+const geminiRateWindows = new Map();
 
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
 app.use(express.json({ limit: "25mb" }));
+app.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  next();
+});
+
+function limitGeminiRequests(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  const window = geminiRateWindows.get(key);
+  const current =
+    !window || now - window.startedAt >= 60_000
+      ? { startedAt: now, count: 0 }
+      : window;
+
+  current.count += 1;
+  geminiRateWindows.set(key, current);
+  if (current.count > 30) {
+    res.status(429).json({
+      ok: false,
+      error: "Too many Gemini requests. Try again shortly."
+    });
+    return;
+  }
+
+  if (geminiRateWindows.size > 1_000) {
+    for (const [windowKey, entry] of geminiRateWindows) {
+      if (now - entry.startedAt >= 60_000) {
+        geminiRateWindows.delete(windowKey);
+      }
+    }
+  }
+  next();
+}
+
+app.use(
+  ["/analyze-recording", "/analyze-transcript", "/live-speak", "/live-speak-audio"],
+  limitGeminiRequests
+);
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "cartalk-live-relay",
     port: config.port,
-    model: config.geminiLiveModel
+    model: config.geminiLiveModel,
+    liveInputRelayEnabled,
+    activeDemoDevices: demoNetwork.getPresenceCount()
   });
+});
+
+app.post("/presence", (req, res) => {
+  try {
+    const presence = demoNetwork.setPresence(req.body ?? {});
+    res.json({ ok: true, presence });
+  } catch (error) {
+    res.status(400).json({
+      ok: false,
+      error: error instanceof Error ? error.message : "Invalid presence"
+    });
+  }
+});
+
+app.post("/presence/offline", (req, res) => {
+  demoNetwork.clearPresence(req.body?.userId);
+  res.json({ ok: true });
+});
+
+app.post("/resolve-recipient", (req, res) => {
+  const recipient = demoNetwork.resolveRecipient(req.body ?? {});
+  res.json({ ok: true, recipient });
+});
+
+app.post("/deliver", (req, res) => {
+  const delivery = demoNetwork.sendDelivery(req.body ?? {});
+  if (!delivery) {
+    res.status(409).json({ ok: false, error: "Recipient is not online" });
+    return;
+  }
+  res.json({ ok: true, deliveryId: delivery.id });
+});
+
+app.get("/deliveries", (req, res) => {
+  const userId = typeof req.query.userId === "string" ? req.query.userId : "";
+  if (!userId) {
+    res.status(400).json({ ok: false, error: "Missing userId" });
+    return;
+  }
+  res.json({ ok: true, deliveries: demoNetwork.listDeliveries(userId) });
+});
+
+app.post("/deliveries/ack", (req, res) => {
+  const { userId, deliveryId } = req.body ?? {};
+  if (!userId || !deliveryId) {
+    res.status(400).json({ ok: false, error: "Missing userId or deliveryId" });
+    return;
+  }
+  demoNetwork.acknowledgeDelivery(userId, deliveryId);
+  res.json({ ok: true });
 });
 
 app.post("/analyze-recording", async (req, res) => {
@@ -121,7 +220,7 @@ app.get("/live-speak-audio", async (req, res) => {
   }
 });
 
-wsServer.on("connection", (socket) => {
+wsServer?.on("connection", (socket) => {
   void attachGeminiRelay(socket);
 });
 

@@ -208,7 +208,7 @@ async function runGeminiLiveSpeakOnce(prompt, styleInstruction) {
 
     const timeout = setTimeout(() => {
       settle(reject, new Error("Gemini live speak timed out before returning audio."));
-    }, 12_000);
+    }, 9_000);
 
     try {
       session = await ai.live.connect({
@@ -309,24 +309,22 @@ async function runGeminiLiveSpeakOnce(prompt, styleInstruction) {
 
 export async function runGeminiLiveSpeak(prompt, voiceStyle = "schoolmaster") {
   let lastError = null;
+  const styleAttempts = getSpeakStyleAttempts(voiceStyle);
+  const attempts = Array.from(
+    { length: 3 },
+    (_, index) => styleAttempts[index] || styleAttempts[styleAttempts.length - 1]
+  );
 
-  for (let retryAttempt = 0; retryAttempt < 3; retryAttempt += 1) {
-    for (const styleInstruction of getSpeakStyleAttempts(voiceStyle)) {
-      try {
-        return await runGeminiLiveSpeakOnce(prompt, styleInstruction);
-      } catch (error) {
-        lastError = error;
-        if (!shouldContinueVoiceFallback(error)) {
-          if (!shouldRetryLiveSpeakError(error) || retryAttempt === 2) {
-            throw error;
-          }
-          break;
-        }
+  for (let attempt = 0; attempt < attempts.length; attempt += 1) {
+    try {
+      return await runGeminiLiveSpeakOnce(prompt, attempts[attempt]);
+    } catch (error) {
+      lastError = error;
+      const retryable = shouldContinueVoiceFallback(error) || shouldRetryLiveSpeakError(error);
+      if (!retryable || attempt === attempts.length - 1) {
+        throw error;
       }
-    }
-
-    if (retryAttempt < 2) {
-      await new Promise((resolve) => setTimeout(resolve, 700 + retryAttempt * 500));
+      await new Promise((resolve) => setTimeout(resolve, 350 + attempt * 250));
     }
   }
 

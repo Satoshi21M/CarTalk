@@ -1,4 +1,5 @@
 import { Provider } from "@/types/app-state";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   GoogleAuthProvider,
   signInAnonymously,
@@ -22,19 +23,32 @@ export interface AuthService {
   signOut(): Promise<AuthSession>;
 }
 
+const DEVICE_ID_KEY = "cartalk.device-id";
+
+async function getOrCreateDeviceId() {
+  const existing = await AsyncStorage.getItem(DEVICE_ID_KEY);
+  if (existing) {
+    return existing;
+  }
+
+  const deviceId = `device-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  await AsyncStorage.setItem(DEVICE_ID_KEY, deviceId);
+  return deviceId;
+}
+
 export const mockAuthService: AuthService = {
   async signIn(provider) {
     return {
       isSignedIn: true,
       provider,
-      userId: `mock-${provider}-user`
+      userId: await getOrCreateDeviceId()
     };
   },
   async ensureSession() {
     return {
       isSignedIn: true,
       provider: "anonymous",
-      userId: "mock-anonymous-user"
+      userId: await getOrCreateDeviceId()
     };
   },
   async signOut() {
