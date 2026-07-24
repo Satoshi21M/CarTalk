@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Animated, Platform, Text, View } from "react-native";
+import { Animated, AppState, Text, View } from "react-native";
 import * as Speech from "expo-speech";
 import * as FileSystem from "expo-file-system";
 import {
@@ -50,17 +50,35 @@ type MainPhase = "wake" | "listening" | "finalizing" | "processing" | "replying"
 type FinalizeReason = "submit" | "silence";
 type AudioModeState = "listening" | "playback" | null;
 
-const WAKE_PHRASES = ["hey cartalk", "he cartalk", "hey car talk", "hé cartalk", "hee cartalk"];
+const WAKE_PHRASES = [
+  "hey cartalk",
+  "he cartalk",
+  "hé cartalk",
+  "hee cartalk",
+  "hey car talk",
+  "hé car talk",
+  "hee car talk",
+  "hey kaartalk",
+  "hee kaartalk",
+  "hey kar talk"
+];
 const WAKE_GREETING_VARIANTS = ["hey", "he", "hee", "hi", "hoi", "hae"];
 const WAKE_CARTALK_VARIANTS = [
   "cartalk",
   "cartalk",
   "car talk",
+  "kaartalk",
+  "kaart talk",
+  "kar talk",
+  "car tok",
+  "kar tok",
   "cartok",
   "cartak",
+  "cartolk",
   "kartalk",
   "kartak",
-  "kartok"
+  "kartok",
+  "kartolk"
 ];
 const STOP_PHRASES = [
   "stop",
@@ -107,6 +125,8 @@ const EMPTY_COMMAND_TIMEOUT_MS = 12_000;
 const MAX_COMMAND_DURATION_MS = 45_000;
 const ANALYSIS_TIMEOUT_MS = 20_000;
 const RECIPIENT_RESOLUTION_TIMEOUT_MS = 5_000;
+const WAKE_WATCHDOG_INTERVAL_MS = 4_000;
+const WAKE_START_STALL_TIMEOUT_MS = 8_000;
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -299,6 +319,7 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isDeliveringResponse, setIsDeliveringResponse] = useState(false);
   const [mainPhase, setMainPhase] = useState<MainPhase>("wake");
+  const [wakeRecognizerReady, setWakeRecognizerReady] = useState(false);
   const [speechLevel, setSpeechLevel] = useState(-60);
   const [listeningDotCount, setListeningDotCount] = useState(1);
   const listeningStatusOpacity = useRef(new Animated.Value(0.75)).current;
@@ -318,6 +339,10 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   const commandStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const commandSilenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wakeStartPromiseRef = useRef<Promise<void> | null>(null);
+  const wakeSessionStartedAtRef = useRef(0);
+  const wakeRestartAttemptRef = useRef(0);
+  const appStateRef = useRef(AppState.currentState);
+  const voiceLifecycleActiveRef = useRef(false);
   const pendingCommandStartRef = useRef(false);
   const ignoreRecognitionEndUntilRef = useRef(0);
   const livePlaybackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -372,7 +397,9 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       : isListening
         ? `CarTalk luistert${".".repeat(listeningDotCount)}`
         : mainPhase === "wake"
-          ? "CarTalk wacht op activatie"
+          ? wakeRecognizerReady
+            ? "CarTalk wacht op activatie"
+            : "CarTalk start spraakactivatie..."
           : "";
   const statusLine =
     mode !== "main"
@@ -487,6 +514,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
 
   const stopRecognitionSession = async ({ abort = true }: { abort?: boolean } = {}) => {
     ignoreRecognitionEndUntilRef.current = Date.now() + 1500;
+    setWakeRecognizerReady(false);
+    wakeSessionStartedAtRef.current = 0;
     try {
       if (abort) {
         ExpoSpeechRecognitionModule.abort();
@@ -1014,6 +1043,16 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   };
 
   const startWakeRecognition = async () => {
+    if (
+      mode !== "main" ||
+      !voiceLifecycleActiveRef.current ||
+      appStateRef.current !== "active" ||
+      isAnalyzingRef.current ||
+      isDeliveringResponseRef.current
+    ) {
+      return;
+    }
+
     if (wakeStartPromiseRef.current) {
       return wakeStartPromiseRef.current;
     }
@@ -1025,21 +1064,42 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       updateMainPhase("wake");
       setAnalysis(null);
       setAnalysisStatus("");
+      setWakeRecognizerReady(false);
+      wakeSessionStartedAtRef.current = Date.now();
 
       try {
+        if (!ExpoSpeechRecognitionModule.isRecognitionAvailable()) {
+          throw new Error("Spraakherkenning is niet beschikbaar op deze iPhone.");
+        }
+
         const recognitionState = await ExpoSpeechRecognitionModule.getStateAsync();
         if (recognitionState !== "inactive") {
           await stopRecognitionSession();
         }
+        if (
+          !voiceLifecycleActiveRef.current ||
+          appStateRef.current !== "active" ||
+          mainPhaseRef.current !== "wake"
+        ) {
+          return;
+        }
         await setListeningAudioMode();
+        if (
+          !voiceLifecycleActiveRef.current ||
+          appStateRef.current !== "active" ||
+          mainPhaseRef.current !== "wake"
+        ) {
+          return;
+        }
         ExpoSpeechRecognitionModule.start({
           lang: "nl-NL",
           interimResults: true,
           continuous: true,
           addsPunctuation: false,
-          requiresOnDeviceRecognition:
-            Platform.OS === "ios" && ExpoSpeechRecognitionModule.supportsOnDeviceRecognition(),
-          iosTaskHint: "confirmation",
+          // supportsOnDeviceRecognition() checks the device's default locale, not nl-NL.
+          // Network recognition is the reliable fallback when the Dutch model is not installed.
+          requiresOnDeviceRecognition: false,
+          iosTaskHint: "search",
           iosCategory: {
             category: "playAndRecord",
             categoryOptions: ["defaultToSpeaker", "allowBluetooth"],
@@ -1051,6 +1111,8 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
             "CarTalk",
             "car talk",
             "cartalk",
+            "kaartalk",
+            "kar talk",
             "rode Mercedes",
             "verlichting",
             "achterlicht",
@@ -1064,9 +1126,14 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
           }
         });
       } catch (error) {
+        wakeSessionStartedAtRef.current = 0;
+        setWakeRecognizerReady(false);
         setAnalysisStatus(
           error instanceof Error ? error.message : "CarTalk kon de spraakactivatie niet starten."
         );
+        if (voiceLifecycleActiveRef.current && appStateRef.current === "active") {
+          restartWakeAfterDelay(900);
+        }
       }
     })().finally(() => {
       wakeStartPromiseRef.current = null;
@@ -1357,7 +1424,13 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   };
 
   useSpeechRecognitionEvent("start", () => {
-    // The recognizer lifecycle is controlled by the explicit phase refs.
+    if (mode === "main" && mainPhaseRef.current === "wake") {
+      wakeSessionStartedAtRef.current = Date.now();
+      wakeRestartAttemptRef.current = 0;
+      setWakeRecognizerReady(true);
+      setAnalysisStatus("");
+      console.info("[CarTalk] Wake recognizer ready");
+    }
   });
 
   useSpeechRecognitionEvent("end", () => {
@@ -1369,12 +1442,18 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       return;
     }
 
+    setWakeRecognizerReady(false);
+    wakeSessionStartedAtRef.current = 0;
+
     if (pendingCommandStartRef.current) {
       return;
     }
 
     if (mainPhaseRef.current === "wake" && !isAnalyzingRef.current && !isDeliveringResponseRef.current) {
-      scheduleWakeRestart(350);
+      if (appStateRef.current === "active") {
+        console.info("[CarTalk] Wake recognizer ended; restarting");
+        scheduleWakeRestart(350);
+      }
       return;
     }
 
@@ -1406,10 +1485,15 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
     if (mainPhaseRef.current === "wake") {
       setSpeechLevel(-18);
       const combinedWakeTranscript = pushWakeTranscript(latestTranscript);
+      const wakeMatched = includesWakePhrase(combinedWakeTranscript || latestTranscript);
+      console.info("[CarTalk] Wake transcript received", {
+        matched: wakeMatched,
+        segmentCount: wakeTranscriptBufferRef.current.length
+      });
 
-      if (includesWakePhrase(combinedWakeTranscript || latestTranscript)) {
+      if (wakeMatched) {
         onActivateDrivingMode();
-        startNewTurn(stripWakePhrase(latestTranscript));
+        startNewTurn(stripWakePhrase(combinedWakeTranscript || latestTranscript));
         void startCommandRecognition();
       }
 
@@ -1445,21 +1529,46 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       return;
     }
 
+    console.warn("[CarTalk] Speech recognizer error", {
+      phase: mainPhaseRef.current,
+      code: event.error,
+      nativeCode: event.code ?? null
+    });
+    setWakeRecognizerReady(false);
+    wakeSessionStartedAtRef.current = 0;
+
     if (event.error === "no-speech" || event.error === "speech-timeout") {
       if (mode === "main") {
         if (mainPhaseRef.current === "listening") {
           resumeCommandRecognition();
-        } else {
+        } else if (appStateRef.current === "active") {
           restartWakeAfterDelay(350);
         }
       }
       return;
     }
 
-    if (event.error === "service-not-allowed") {
+    if (
+      event.error === "service-not-allowed" ||
+      event.error === "not-allowed" ||
+      event.error === "language-not-supported"
+    ) {
       setAnalysisStatus(
-        "Spraakactivatie is hier niet beschikbaar. Test 'Hey CarTalk' op een echte iPhone in plaats van in de simulator."
+        event.message || "Spraakactivatie heeft toegang tot de microfoon en spraakherkenning nodig."
       );
+      return;
+    }
+
+    if (mode === "main" && mainPhaseRef.current === "wake" && appStateRef.current === "active") {
+      wakeRestartAttemptRef.current += 1;
+      const restartDelay = Math.min(3_000, 450 * wakeRestartAttemptRef.current);
+      setAnalysisStatus("CarTalk herstart spraakactivatie...");
+      restartWakeAfterDelay(restartDelay);
+      return;
+    }
+
+    if (mode === "main" && mainPhaseRef.current === "listening") {
+      resumeCommandRecognition();
       return;
     }
 
@@ -1467,24 +1576,106 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
   });
 
   useEffect(() => {
-    let locService: DrivingLocationService | null = null;
+    let cancelled = false;
+    voiceLifecycleActiveRef.current = true;
+    appStateRef.current = AppState.currentState;
+
+    const appStateSubscription =
+      mode === "main"
+        ? AppState.addEventListener("change", (nextState) => {
+            appStateRef.current = nextState;
+
+            if (nextState !== "active") {
+              console.info("[CarTalk] Voice lifecycle suspended", { appState: nextState });
+              clearWakeRestart();
+              setWakeRecognizerReady(false);
+              wakeSessionStartedAtRef.current = 0;
+              if (mainPhaseRef.current === "wake") {
+                try {
+                  ExpoSpeechRecognitionModule.abort();
+                } catch {
+                  // The watchdog will restore the session when the app becomes active.
+                }
+              }
+              return;
+            }
+
+            if (
+              mainPhaseRef.current === "wake" &&
+              !isAnalyzingRef.current &&
+              !isDeliveringResponseRef.current
+            ) {
+              console.info("[CarTalk] Voice lifecycle resumed");
+              restartWakeAfterDelay(450);
+            }
+          })
+        : null;
+
+    const wakeWatchdog =
+      mode === "main"
+        ? setInterval(() => {
+            if (
+              cancelled ||
+              appStateRef.current !== "active" ||
+              mainPhaseRef.current !== "wake" ||
+              isAnalyzingRef.current ||
+              isDeliveringResponseRef.current ||
+              wakeStartPromiseRef.current
+            ) {
+              return;
+            }
+
+            void ExpoSpeechRecognitionModule.getStateAsync()
+              .then((recognitionState) => {
+                if (cancelled || mainPhaseRef.current !== "wake" || appStateRef.current !== "active") {
+                  return;
+                }
+
+                if (recognitionState === "recognizing") {
+                  setWakeRecognizerReady(true);
+                  return;
+                }
+
+                const startStalled =
+                  recognitionState === "starting" &&
+                  wakeSessionStartedAtRef.current > 0 &&
+                  Date.now() - wakeSessionStartedAtRef.current > WAKE_START_STALL_TIMEOUT_MS;
+
+                if (recognitionState === "inactive" || startStalled) {
+                  console.info("[CarTalk] Wake watchdog restarting recognizer", {
+                    recognitionState,
+                    startStalled
+                  });
+                  restartWakeAfterDelay(0);
+                }
+              })
+              .catch(() => {
+                if (!cancelled && appStateRef.current === "active") {
+                  restartWakeAfterDelay(500);
+                }
+              });
+          }, WAKE_WATCHDOG_INTERVAL_MS)
+        : null;
 
     void (async () => {
       try {
         if (mode === "main") {
           const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+          if (cancelled) {
+            return;
+          }
           setMicPermission(permission.granted ? "granted" : "denied");
+          if (!permission.granted) {
+            setAnalysisStatus("Geef CarTalk toegang tot de microfoon en spraakherkenning.");
+            return;
+          }
           await startWakeRecognition();
+          if (cancelled) {
+            return;
+          }
           void ensureRelayHealth({ surfaceFailure: true }).catch(() => {
             // The idle UI already gets a clearer status message via ensureRelayHealth.
           });
-
-          if (state.userId) {
-            locService = new DrivingLocationService();
-            await locService.start(state.userId, ({ lat, lng }) => {
-              currentLocationRef.current = { lat, lng };
-            });
-          }
 
           return;
         }
@@ -1504,6 +1695,12 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
 
     const responsePlayerForCleanup = responsePlayerRef.current;
     return () => {
+      cancelled = true;
+      voiceLifecycleActiveRef.current = false;
+      appStateSubscription?.remove();
+      if (wakeWatchdog) {
+        clearInterval(wakeWatchdog);
+      }
       clearWakeRestart();
       clearCommandStart();
       clearCommandSilenceTimeout();
@@ -1515,13 +1712,25 @@ export function NativeVoiceTest({ active, mode = "main", onActivateDrivingMode }
       void clearResponseAudioFile();
       if (mode === "main") {
         ExpoSpeechRecognitionModule.abort();
-        if (locService && state.userId) {
-          void locService.stop(state.userId);
-        }
       }
     };
     // This effect owns the native voice session and must not restart on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  useEffect(() => {
+    if (mode !== "main" || !state.userId) {
+      return;
+    }
+
+    const locService = new DrivingLocationService();
+    void locService.start(state.userId, ({ lat, lng }) => {
+      currentLocationRef.current = { lat, lng };
+    });
+
+    return () => {
+      void locService.stop(state.userId);
+    };
   }, [mode, state.userId]);
 
   useEffect(() => {
