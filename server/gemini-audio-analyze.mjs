@@ -246,7 +246,16 @@ async function generateCarTalkResponse(ai, model, parts, transcriptHint = "") {
   const response = await withGeminiRetry(() =>
     ai.models.generateContent({
       model,
-      contents: [createPartFromText(buildPrompt(transcriptHint)), ...parts]
+      contents: [createPartFromText(buildPrompt(transcriptHint)), ...parts],
+      config: {
+        // Safety classification follows a strict schema and does not benefit from
+        // a long hidden reasoning pass. Disabling it keeps voice turns responsive.
+        thinkingConfig: {
+          thinkingBudget: 0
+        },
+        maxOutputTokens: 320,
+        temperature: 0.1
+      }
     })
   );
 

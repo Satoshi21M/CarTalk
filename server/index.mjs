@@ -69,6 +69,8 @@ app.get("/health", (_req, res) => {
     service: "cartalk-live-relay",
     port: config.port,
     model: config.geminiLiveModel,
+    analysisModel: config.geminiAnalysisModel,
+    analysisMode: "low-latency",
     liveInputRelayEnabled,
     activeDemoDevices: demoNetwork.getPresenceCount()
   });
