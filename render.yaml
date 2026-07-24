@@ -3,6 +3,7 @@ services:
     name: cartalk-relay-us
     runtime: docker
     region: virginia
+    plan: free
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     envVars:
